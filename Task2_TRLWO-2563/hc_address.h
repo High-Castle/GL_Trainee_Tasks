@@ -88,4 +88,15 @@ static inline int hc_set_address_inet6(const char *addr_str,
     return 0;
 }
 
+static int hc_set_address(const char *addr_str, unsigned short port,
+    struct sockaddr *addr)
+{
+    char addr_fmt_str[INET6_ADDRSTRLEN];
+
+    if (!hc_format_address_inet(addr_str, addr_fmt_str))
+        return hc_set_address_inet(addr_fmt_str, port, addr);
+
+    return hc_set_address_inet6(addr_str, port, addr);
+}
+
 #endif

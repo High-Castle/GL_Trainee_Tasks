@@ -17,6 +17,8 @@
 #include "hc_list.h"
 #include "hc_event_handler.h"
 
+#include "server_config.h"
+
 #define LISTEN_QUEUE_LENGTH 10
 #define SERVER_MAX_EPOLL_EVENT_N 20
 
@@ -52,26 +54,6 @@ static hc_event_handler_call_table client_ctable = {
 static void handle_server_intsig(int sig)
 {
     int_sig_occured = 1;
-}
-
-static int set_address(const char *addr_str, unsigned short port,
-    struct sockaddr *addr)
-{
-    char addr_fmt_str[INET6_ADDRSTRLEN];
-
-    if (!hc_format_address_inet(addr_str, addr_fmt_str))
-        return hc_set_address_inet(addr_fmt_str, port, addr);
-
-    return hc_set_address_inet6(addr_str, port, addr);
-}
-
-static int get_address(const struct sockaddr *addr, char *addr_dst_str,
-    unsigned short *dst_port)
-{
-    if (addr->sa_family == AF_INET)
-        return hc_get_address_inet(addr, addr_dst_str, dst_port);
-
-    return hc_get_address_inet6(addr, addr_dst_str, dst_port);
 }
 
 static int set_non_blocking (int fd)
@@ -247,25 +229,18 @@ static int tcp_server_client_handler(hc_event_handler_t *obj, void *arg)
     return 0;
 }
 
-static int create_listening_socket(char const *addr_str, unsigned short port)
+static int create_listening_socket(const struct sockaddr *addr, size_t addr_sz)
 {
     int fd, local_errno;
-    struct sockaddr_storage addr_buff;
 
-    if(set_address(addr_str, port, (struct sockaddr *)&addr_buff))
+
+    if ((fd = socket(addr->sa_family, SOCK_STREAM, 0)) == -1)
     {
         local_errno = errno;
         goto ERR_EXIT;
     }
 
-    if ((fd = socket(addr_buff.ss_family, SOCK_STREAM, 0)) == -1)
-    {
-        local_errno = errno;
-        goto ERR_EXIT;
-    }
-
-    if (bind(fd, (struct sockaddr *)&addr_buff,
-	sizeof(struct sockaddr_storage)))
+    if (bind(fd, addr, addr_sz))
     {
         local_errno = errno;
         goto ERR_EXIT_FD;
@@ -286,24 +261,14 @@ ERR_EXIT:
     return -1;
 }
 
-int main(int arg_n, char **args)
+int main(void)
 {
     tcp_server_t server;
+    server_config_t config;
     int epoll_instance_fd, server_socket_fd, local_errno;
     struct epoll_event event_buff;
     struct epoll_event * triggered_events_buff;
-    const char *addr_str;
-    int port;
 
-    //TODO: will be removed after config implementation
-    if (arg_n != 3)
-        return -1;
-
-    addr_str = args[1];
-    port = atoi(args[2]);
-
-    if (port > USHRT_MAX)
-        return -1;
 
     if (signal(SIGINT, handle_server_intsig) == SIG_ERR)
     {
@@ -327,11 +292,22 @@ int main(int arg_n, char **args)
         goto ERR_EXIT_EPOLL_BUFF;
     }
 
-    if ((server_socket_fd = create_listening_socket(addr_str, port)) == -1)
+    if (server_config_json_init(&config, "config.json", "defaults_config.json",
+        255, 255))
     {
         local_errno = errno;
+        goto ERR_EXIT_EPOLL_BUFF;
+    }
+
+    if ((server_socket_fd = create_listening_socket(
+        (struct sockaddr *)&config.address, sizeof(config.address))) == -1)
+    {
+        local_errno = errno;
+        server_config_free(&config);
         goto ERR_EXIT_EPOLL_CREATED;
     }
+
+    server_config_free(&config);
 
     if (set_non_blocking(server_socket_fd))
     {
@@ -371,7 +347,7 @@ int main(int arg_n, char **args)
         if (triggered_num == -1)
         {
             if (errno == EINTR)
-		break;
+                 break;
             local_errno = errno;
             goto ERR_EXIT_SERV_SOCK;
         }
@@ -379,8 +355,8 @@ int main(int arg_n, char **args)
         for (int idx = 0; idx < triggered_num; ++idx)
         {
             if (hc_event_handler_handle_event(
-		triggered_events_buff[idx].data.ptr,
-		&triggered_events_buff[idx].events))
+                triggered_events_buff[idx].data.ptr,
+                &triggered_events_buff[idx].events))
             {
                 perror("Exception");
             }
@@ -406,6 +382,6 @@ ERR_EXIT_EPOLL_CREATED:
 ERR_EXIT_EPOLL_BUFF:
     free(triggered_events_buff);
 ERR_EXIT:
-    fprintf(stderr, "Exception : %s", strerror(local_errno));
+    fprintf(stderr, "\nException : %s", strerror(local_errno));
     return -1;
 }
