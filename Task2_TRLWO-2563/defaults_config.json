@@ -1,8 +1,8 @@
 {
-    "root_path" : "." ,
+    "root_path" : "./" ,
     "file_name" : "index.html" ,
     "address" : "0.0.0.0",
-    "port" : "8080" ,
+    "port" : "8083" ,
     "ssl" : false,
-    "logging" : "0"
+    "logging" : ["ACCESS"]
 }

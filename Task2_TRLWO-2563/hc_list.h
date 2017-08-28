@@ -2,6 +2,7 @@
 #define __HC_LIST_H__
 
 #include <stddef.h>
+#include <assert.h>
 
 typedef struct hc_list_node {
     struct hc_list_node *next;
@@ -27,9 +28,43 @@ static inline void hc_list_init(hc_list_t *list)
     list->sentinel.prev = &list->sentinel;
 }
 
+static inline int hc_list_empty(hc_list_t *l)
+{
+    if ((void *)l == (void *)(l->sentinel.next))
+    {
+        assert((void *)l == (void *)(l->sentinel.prev));
+        return 1;
+    }
+    assert((void *)l != (void *)(l->sentinel.prev));
+    return 0;
+}
+
 static inline void hc_list_destroy(hc_list_t *list)
 {
+    (void)(list);
 }
+
+
+static inline void hc_list_move_init(hc_list_t *list, hc_list_t *from)
+{
+    assert(hc_list_empty(list));
+
+    if (hc_list_empty(from))
+    {
+        hc_list_init(list);
+        return ;
+    }
+
+    list->sentinel.next = from->sentinel.next;
+    list->sentinel.next->prev = &list->sentinel;
+
+    list->sentinel.prev = from->sentinel.prev;
+    list->sentinel.prev->next = &list->sentinel;
+
+    from->sentinel.next = &from->sentinel;
+    from->sentinel.prev = &from->sentinel;
+}
+
 
 static inline void hc_list_for_each_node (hc_list_node *from, hc_list_node *to,
     void(*func)(hc_list_node*))
@@ -89,7 +124,7 @@ static inline void hc_list_node_purge (hc_list_node *it)
 {
     hc_list_node *next_node = hc_list_node_next(it);
     next_node->prev = it->prev;
-    it->prev->next=next_node;
+    it->prev->next = next_node;
 }
 
 static inline hc_list_node * hc_list_begin (hc_list_t *l)

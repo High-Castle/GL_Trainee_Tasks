@@ -10,13 +10,13 @@ static inline int hc_format_address_inet(const char *in_addr, char *out_addr)
 {
     unsigned char decimals[4];
     int res = sscanf(in_addr, "%hhu.%hhu.%hhu.%hhu",
-	&decimals[0], &decimals[1], &decimals[2], &decimals[3]);
+    &decimals[0], &decimals[1], &decimals[2], &decimals[3]);
 
     if (res < 4)
         return -1;
 
     sprintf(out_addr, "%hhu.%hhu.%hhu.%hhu",
-	decimals[0], decimals[1], decimals[2], decimals[3]);
+    decimals[0], decimals[1], decimals[2], decimals[3]);
 
     return 0;
 }
@@ -88,7 +88,7 @@ static inline int hc_set_address_inet6(const char *addr_str,
     return 0;
 }
 
-static int hc_set_address(const char *addr_str, unsigned short port,
+inline static int hc_set_address(const char *addr_str, unsigned short port,
     struct sockaddr *addr)
 {
     char addr_fmt_str[INET6_ADDRSTRLEN];
