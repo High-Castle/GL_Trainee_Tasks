@@ -1,24 +1,24 @@
 #ifndef __HC_EVENT_HANDLER_H__
 #define __HC_EVENT_HANDLER_H__
 
-typedef struct hc_event_handler_t {
-    struct hc_event_handler_call_table const *table_;
-} hc_event_handler_t;
+typedef struct hc_event_handler_iface {
+    struct hc_event_handler_ctable_t const *ctable;
+} hc_event_handler_iface;
 
-typedef struct hc_event_handler_call_table {
-    int(* handle_mfree)(void *);
-    int(* handle_event)(hc_event_handler_t *, void *);
-} hc_event_handler_call_table;
+typedef struct hc_event_handler_ctable_t {
+    int(* handle_mfree)(hc_event_handler_iface *);
+    int(* handle_event)(hc_event_handler_iface *, void *);
+} hc_event_handler_ctable_t;
 
-static inline int hc_event_handler_mfree(hc_event_handler_t *arg)
+inline static int hc_event_handler_mfree(hc_event_handler_iface *obj)
 {
-    return arg->table_->handle_mfree(arg);
+    return obj->ctable->handle_mfree(obj);
 }
 
-static inline int hc_event_handler_handle_event(hc_event_handler_t *arg,
+inline static int hc_event_handler_handle_event(hc_event_handler_iface *obj,
     void *arg_ev)
 {
-    return arg->table_->handle_event(arg, arg_ev);
+    return obj->ctable->handle_event(obj, arg_ev);
 }
 
 #endif
