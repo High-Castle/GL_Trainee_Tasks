@@ -13,7 +13,6 @@
 #include <sys/epoll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/sendfile.h>
 #include <arpa/inet.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -28,11 +27,11 @@
 #include "server_config.h"
 
 #define LISTEN_QUEUE_LENGTH 100
-#define SERVER_MAX_EPOLL_EVENT_N 200
+#define SERVER_MAX_EPOLL_EVENT_N 1
 #define SERVER_DEFAULT_KA_TIMEOUT_MSEC 10 * 1000
 #define CTE_BUFF_SZ 1024
 #define REQUEST_BUFF_SZ  256
-
+#define SEND_FILE_BUFF_SZ 1024
 // TODO: add support for multiple pipe readers
 // TODO: to inactive change on write EWOULDBLOCK (and wait for EPOLLOUT)
 
@@ -147,8 +146,9 @@ typedef struct http_client_task_data_t
 
     union {
         struct {
-            off64_t current_offset;
-            size_t fsize;
+            unsigned char *buff;
+            size_t buff_sz;
+            size_t to_read_sz;
             int fd;
         } send_file;
 
@@ -241,7 +241,7 @@ static int http_client_routine_sendall(http_client_t *, size_t quant,
     int flags);
 static int http_client_task_data_init(http_client_task_data_t *, size_t uri_sz);
 static int http_client_task_data_task_send_file_init(http_client_task_data_t *,
-    int fd, size_t fsize);
+    size_t buff_sz, int fd, size_t fsize);
 static int http_client_task_data_task_send_cte_init(http_client_task_data_t *,
     int fd, size_t buff_sz);
 static int http_client_task_data_task_rewind(http_client_task_data_t *);
@@ -582,7 +582,7 @@ int http_server_request_log_print_start (http_server_t *obj)
         curr_time_info->tm_min,
         curr_time_info->tm_sec);
 
-    fflush(stdout);
+    fflush(obj->shared.config.logging_out);
 
     return printed;
 }
@@ -602,7 +602,7 @@ int http_client_request_log (http_client_t *obj, int response_code)
     curr_time_info = localtime(
         &(*obj).logging.last_request_processing_start_tm);
 
-    printed = fprintf(obj->server_ref->shared.config.logging_out, 
+    printed = fprintf(obj->server_ref->shared.config.logging_out,
 		"\r\n%.2u-%.2u-%.2u %.2u:%.2u:%.2u %lld.%lld %s:%hu %s %s %d",
         (curr_time_info->tm_year + 1900),
         curr_time_info->tm_mon,
@@ -617,7 +617,7 @@ int http_client_request_log (http_client_t *obj, int response_code)
         (*obj).task_data.parsing.uri_str,
         response_code);
 
-    fflush(stdout);
+    fflush(obj->server_ref->shared.config.logging_out);
 
     return printed;
 }
@@ -804,13 +804,16 @@ int http_client_task_data_init(http_client_task_data_t *obj,
 }
 
 int http_client_task_data_task_send_file_init(
-    http_client_task_data_t *obj, int fd, size_t fsize)
+    http_client_task_data_t *obj, size_t buff_sz, int fd, size_t fsize)
 {
     assert(obj->active_data == HTTP_CLIENT_TASK_DATA_NIL);
 
+    if (!(obj->task.send_file.buff = malloc(buff_sz)))
+        return -1;
+
+    obj->task.send_file.buff_sz = buff_sz;
     obj->task.send_file.fd = fd;
-    obj->task.send_file.fsize = fsize;
-    obj->task.send_file.current_offset = 0;
+    obj->task.send_file.to_read_sz = fsize;
 
     obj->active_data = HTTP_CLIENT_TASK_DATA_TASK_SENDFILE;
     return 0;
@@ -851,6 +854,7 @@ int http_client_task_data_task_rewind(http_client_task_data_t *obj)
             return 0;
         case HTTP_CLIENT_TASK_DATA_TASK_SENDFILE:
             close(obj->task.send_file.fd);
+            free(obj->task.send_file.buff);
             break;
         case HTTP_CLIENT_TASK_DATA_TASK_SEND_CTE:
             close(obj->task.send_cte.fd);
@@ -988,7 +992,7 @@ int http_client_task_response_get (http_client_t *obj)
             (*(*obj).server_ref).shared.client_writes_uri_here));
 
         if (!(fd = open(obj->server_ref->shared.uri_path_client_buff,
-            O_RDONLY | O_NONBLOCK | O_LARGEFILE)))
+            O_RDONLY | O_NONBLOCK)))
         {
             switch (errno)
             {
@@ -1036,7 +1040,7 @@ int http_client_task_response_get (http_client_t *obj)
             }
 
             if (http_client_task_data_task_send_file_init(&obj->task_data,
-                fd, stat.st_size))
+                SEND_FILE_BUFF_SZ, fd, stat.st_size))
             {
                 close(fd);
                 http_client_disconnect(obj);
@@ -1143,53 +1147,90 @@ int http_client_task_response_get (http_client_t *obj)
 
 int http_client_task_sendfile (http_client_t *obj)
 {
-    size_t quant, bytes_remaining, bytes_to_send;
-    ssize_t sent;
-
-    assert((*obj).task_data.active_data
-        == HTTP_CLIENT_TASK_DATA_TASK_SENDFILE);
-
     http_client_debug_log(obj, SERVER_LOG_TRACE,
-        "calling \"http_client_task_sendfile\"");
+            "calling \"http_client_task_sendfile\"");
 
-    quant = http_client_compute_quant(obj);
+    assert((*obj).task_data.active_data == HTTP_CLIENT_TASK_DATA_TASK_SENDFILE);
 
-    bytes_remaining = (*obj).task_data.task.send_file.fsize
-        - (*obj).task_data.task.send_file.current_offset;
-
-    bytes_to_send = bytes_remaining < quant ? bytes_remaining : quant;
-
-	http_client_debug_log(obj, SERVER_LOG_TRACE, "transfering %d --> %d",
-		(*obj).task_data.task.send_file.fd, (*obj).fd);
-
-    sent = sendfile64((*obj).fd, (*obj).task_data.task.send_file.fd,
-        &(*obj).task_data.task.send_file.current_offset, bytes_to_send);
-
-    if (sent == -1)
+    switch ((*obj).task_data.state)
     {
-        assert((size_t)(*obj).task_data.task.send_file.current_offset
-            < (*obj).task_data.task.send_file.fsize);
+    case HTTP_CLIENT_TASK_STATE_INITIAL:
+    {
+        ssize_t read_bytes;
 
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        http_client_debug_log(obj, SERVER_LOG_TRACE, "transfering %d --> %d",
+                    (*obj).task_data.task.send_file.fd, (*obj).fd);
+
+        read_bytes = read((*obj).task_data.task.send_file.fd,
+            (*obj).task_data.task.send_file.buff,
+            (*obj).task_data.task.send_file.buff_sz);
+
+        if (read_bytes == -1)
         {
-            // TODO: to inactive change
-        }
-        else
-        {
+            assert((*obj).task_data.task.send_file.to_read_sz);
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                // TODO: to inactive change
+                return HTTP_CLIENT_TASK_CODE_SUCCESS;
+            }
+
             http_client_debug_log(obj, SERVER_LOG_INFO, "%d: %s",
                 __LINE__, strerror(errno));
             http_client_disconnect(obj);
+            return HTTP_CLIENT_TASK_CODE_SUCCESS;
         }
 
-        return HTTP_CLIENT_TASK_CODE_SUCCESS;
-    }
+        if (read_bytes == 0)
+        {
+            http_client_switch_to_final(obj);
+            return HTTP_CLIENT_TASK_CODE_SUCCESS;
+        }
 
-    if ((size_t)(*obj).task_data.task.send_file.current_offset
-        == (*obj).task_data.task.send_file.fsize)
-    {
-        http_client_switch_to_final(obj);
-    }
+        (*obj).task_data.task.send_file.to_read_sz -= read_bytes;
 
+        http_client_routine_sendall_set(obj, obj->task_data.task.send_file.buff,
+            read_bytes);
+
+        (*obj).task_data.state = HTTP_CLIENT_TASK_STATE_SENDALL;
+    }
+    case HTTP_CLIENT_TASK_STATE_SENDALL:
+
+        switch (http_client_routine_sendall(obj,
+                http_client_compute_quant(obj), 0))
+        {
+            case HTTP_CLIENT_ROUTINE_DONE:
+                http_client_last_active_timestamp_update(obj);
+                break;
+
+            case HTTP_CLIENT_ROUTINE_IN_PROGRESS:
+                http_client_last_active_timestamp_update(obj);
+                return HTTP_CLIENT_TASK_CODE_SUCCESS;
+
+            case HTTP_CLIENT_ROUTINE_ERROR:
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    http_client_debug_log(obj, SERVER_LOG_TRACE,
+                        "EWOULDBLOCK on send");// TODO : to inactive change
+                    return HTTP_CLIENT_TASK_CODE_SUCCESS;
+                }
+
+                http_client_disconnect(obj);
+                return HTTP_CLIENT_TASK_CODE_SUCCESS;
+
+            default :
+                assert(!"bad return value");
+                return HTTP_CLIENT_TASK_CODE_ERROR_FATAL;
+        }
+
+        if ((*obj).task_data.task.send_file.to_read_sz == 0)
+        {
+            http_client_switch_to_final(obj);
+            return HTTP_CLIENT_TASK_CODE_SUCCESS;
+        }
+
+        (*obj).task_data.state = HTTP_CLIENT_TASK_STATE_INITIAL;
+    }
     return HTTP_CLIENT_TASK_CODE_SUCCESS;
 }
 
