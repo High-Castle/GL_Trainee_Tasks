@@ -86,6 +86,12 @@ enum
 
 enum
 {
+	HTTP_CLIENT_RECV_ERRNO_EAGAIN,
+	HTTP_CLIENT_RECV_ERRNO_ERROR
+};
+
+enum
+{
     HTTP_CLIENT_QUANT_C = 10000,
     HTTP_CLIENT_QUANT_B = 100000,
     HTTP_CLIENT_QUANT_A = 1000000,
@@ -193,13 +199,37 @@ typedef struct http_client_t {
     int current_task;
     hc_clock_t timeout_ms;
 
-    int fd;
     int state;
 } http_client_t;
 
 typedef struct http_client_ctable_t {
     hc_event_handler_ctable_t hc_event_handler_ctable;
+    ssize_t (*recv) (http_client_t *obj, void *, size_t);
+    int (*routine_sendall) (http_client_t *obj, size_t quant);
 } http_client_ctable_t;
+
+
+typedef struct http_tcp_client_t {
+    http_client_t client_base;
+    int fd;
+} http_tcp_client_t;
+
+typedef struct http_tcp_client_ctable_t {
+    http_client_ctable_t http_client_ctable;
+} http_tcp_client_ctable_t;
+
+typedef struct http_tls_client_t {
+    http_client_t client_base;
+ //   mbedtls_ssl_context ssl_ctx;
+ //   mbedtls_net_context fd;
+} http_tls_client_t;
+
+typedef struct http_tls_client_ctable_t {
+    http_client_ctable_t http_client_ctable;
+} http_tls_client_ctable_t;
+
+
+
 
 
 static int stream_buff_init(stream_buff_t *, size_t sz);
@@ -211,16 +241,14 @@ static int stream_buff_rewind(stream_buff_t *);
 static http_client_t *http_client_from_hc_event_handler_static_cast(
     hc_event_handler_iface *);
 static http_client_t *http_client_from_hc_list_node_shift(hc_list_node *);
-static int http_client_init(http_client_t *, int fd, http_server_t *,
+static int http_client_init(http_client_t *, http_server_t *,
     const char *addr_ip_str, unsigned short addr_port,
-    unsigned int tm_default_inactive_out, size_t buff_sz);
+    hc_clock_t tm_default_inactive_out, size_t buff_sz);
 static int http_client_free(http_client_t *);
 static int http_client_log_start_processing_time_update(http_client_t *);
-static int http_client_mfree(http_client_t *);
 static int http_client_debug_log(http_client_t *, int level,
     const char *fmt, ...);
 static int http_client_disconnect(http_client_t *);
-static int http_client_from_hc_event_handler_mfree(hc_event_handler_iface *);
 static int http_client_state_inited_to_inactive_change(http_client_t *);
 static int http_client_state_inactive_to_active_change(http_client_t *);
 static int http_client_state_active_to_inactive_change(http_client_t *);
@@ -237,8 +265,6 @@ static int http_uri_recognize(const char *str, int *flags);
 static const char *http_uri_extension(const char *str);
 static int http_client_routine_sendall_set(http_client_t *,
     unsigned char const *data, size_t sz);
-static int http_client_routine_sendall(http_client_t *, size_t quant,
-    int flags);
 static int http_client_task_data_init(http_client_task_data_t *, size_t uri_sz);
 static int http_client_task_data_task_send_file_init(http_client_task_data_t *,
     size_t buff_sz, int fd, size_t fsize);
@@ -262,7 +288,7 @@ static int http_client_handle_event(http_client_t *, void *arg);
 static int http_client_from_hc_event_handler_handle_event(
     hc_event_handler_iface *, void *arg);
 static int http_client_last_active_timestamp_update(http_client_t *);
-static void thunk_list_node_to_http_client_mfree(hc_list_node *ptr);
+static void thunk_list_node_to_http_client_mfree_vcall(hc_list_node *ptr);
 static int http_server_init(http_server_t *, server_config_t *conf,
     int fd, int associated_epoll_fd);
 static int http_server_free(http_server_t *);
@@ -275,6 +301,109 @@ static int create_listening_socket(const struct sockaddr *addr, size_t addr_sz);
 static ssize_t handle_events(http_server_t *server,
     struct epoll_event *triggered_events_buff, size_t ev_numm, int timeout);
 
+
+static int http_client_routine_sendall(http_client_t *obj, size_t quant)
+{
+	return ((http_client_ctable_t *)obj->handler_base.ctable)
+		->routine_sendall(obj, quant);
+}
+
+int http_client_mfree_vcall(http_client_t *obj)
+{
+    return hc_event_handler_mfree(&obj->handler_base);
+}
+
+static ssize_t http_client_recv(http_client_t *obj,
+    void *buff, size_t sz)
+{
+	return ((http_client_ctable_t *)obj->handler_base.ctable)->recv(obj,
+        buff, sz);
+}
+
+static http_tcp_client_t *http_tcp_client_from_http_client_static_cast(
+    http_client_t *obj)
+{
+    return (http_tcp_client_t *)((char *)obj
+        - offsetof(http_tcp_client_t, client_base));
+}
+/*
+static http_tls_client_t *http_tls_client_from_http_client_static_cast(
+    http_client_t *obj)
+{
+    return (http_tls_client_t *)((char *)obj
+        - offsetof(http_tls_client_t, client_base));
+}
+*/
+
+
+static ssize_t http_tcp_client_recv(http_tcp_client_t *obj, void *buff,
+	size_t sz)
+{
+	ssize_t ret;
+
+	http_client_debug_log(&obj->client_base, SERVER_LOG_TRACE,
+		"received from %d", obj->fd);
+
+	if ((ret = recv(obj->fd, buff, sz, 0)) == -1)
+	{
+		if (errno == EAGAIN || errno == EWOULDBLOCK)
+		{
+			errno = HTTP_CLIENT_RECV_ERRNO_EAGAIN;
+			return -1;
+		}
+		errno = HTTP_CLIENT_RECV_ERRNO_ERROR;
+		return -1;
+	}
+
+	return ret;
+}
+
+static ssize_t http_tcp_client_from_http_client_recv(http_client_t *obj,
+	 void *buff, size_t sz)
+{
+	return http_tcp_client_recv(
+		http_tcp_client_from_http_client_static_cast(obj), buff, sz);
+}
+
+
+/*
+static ssize_t http_tls_client_recv(http_tls_client_t *, void *,
+	size_t);
+
+static ssize_t http_tls_client_from_http_client_recv(http_client_t *obj,
+	 void *, size_t);
+*/
+
+
+static int http_tcp_client_routine_sendall(http_tcp_client_t *, size_t quant);
+
+static int http_tcp_client_from_http_client_routine_sendall(http_client_t *obj,
+	size_t quant)
+{
+	return http_tcp_client_routine_sendall(
+		http_tcp_client_from_http_client_static_cast(obj), quant);
+}
+
+/*
+static int http_tls_client_routine_sendall(http_tls_client_t *, size_t quant);
+static int http_tls_client_from_http_client_routine_sendall(http_client_t *obj,
+	size_t quant);
+*/
+
+
+static int http_tcp_client_mfree (http_tcp_client_t *);
+
+static int http_tcp_client_from_http_client_from_hc_event_handler_mfree
+	(hc_event_handler_iface *obj)
+{
+	return http_tcp_client_mfree(http_tcp_client_from_http_client_static_cast(
+		http_client_from_hc_event_handler_static_cast(obj)));
+}
+
+
+
+
+
 static volatile int int_sig_occured;
 
 static http_server_ctable_t http_server_ctable = {
@@ -285,11 +414,36 @@ static http_server_ctable_t http_server_ctable = {
 };
 
 static http_client_ctable_t http_client_ctable = {
+	{
+		NULL,
+		http_client_from_hc_event_handler_handle_event
+	},
+	NULL,
+	NULL
+};
+
+static http_tcp_client_ctable_t http_tcp_client_ctable = {
     {
-        http_client_from_hc_event_handler_mfree,
-        http_client_from_hc_event_handler_handle_event
+		{
+			http_tcp_client_from_http_client_from_hc_event_handler_mfree,
+			http_client_from_hc_event_handler_handle_event
+		},
+		http_tcp_client_from_http_client_recv,
+		http_tcp_client_from_http_client_routine_sendall,
+	}
+};
+/*
+static http_tls_client_ctable_t http_tls_client_ctable = {
+    {
+		{
+			http_tls_client_from_http_client_from_hc_event_handler_mfree,
+			http_client_from_hc_event_handler_handle_event
+		}
+		http_tls_client_from_http_client_recv,
+		http_tls_client_from_http_client_routine_sendall,
     }
 };
+*/
 
 http_client_t *http_client_from_hc_event_handler_static_cast(
     hc_event_handler_iface *obj)
@@ -310,9 +464,9 @@ http_client_t *http_client_from_hc_list_node_shift(hc_list_node *ptr)
      return (http_client_t *)((char *)ptr - offsetof(http_client_t, node));
 }
 
-int http_client_init(http_client_t *obj, int fd, http_server_t *serv,
+int http_client_init(http_client_t *obj, http_server_t *serv,
     const char *addr_ip_str, unsigned short addr_port,
-    unsigned int tm_default_inactive_out, size_t buff_sz)
+    hc_clock_t tm_default_inactive_out, size_t buff_sz)
 {
     int local_errno;
     size_t addr_strlen;
@@ -353,8 +507,6 @@ int http_client_init(http_client_t *obj, int fd, http_server_t *serv,
     obj->current_task = HTTP_CLIENT_TASK_PARSE_REQUEST;
     obj->state = HTTP_CLIENT_STATE_INITED;
 
-    obj->fd = fd;
-
     return 0;
 
 ERR_EXIT_IN_STREAM:
@@ -365,23 +517,45 @@ ERR_EXIT_MALLOC_ADDRESS_IP_STR:
     return -1;
 }
 
+
+int http_tcp_client_init(http_tcp_client_t *obj, http_server_t *serv,
+    const char *addr_ip_str, unsigned short addr_port,
+    hc_clock_t tm_default_inactive_out, size_t buff_sz, int fd)
+{
+	if (http_client_init(&obj->client_base, serv, addr_ip_str, addr_port,
+		tm_default_inactive_out, buff_sz))
+	{
+		return -1;
+	}
+
+	(*obj).client_base.handler_base.ctable =
+		&http_tcp_client_ctable.http_client_ctable.hc_event_handler_ctable;
+
+	obj->fd = fd;
+	return 0;
+}
+
+int http_tcp_client_free(http_tcp_client_t *obj)
+{
+	close(obj->fd);
+	return http_client_free(&obj->client_base);
+}
+
+int http_tcp_client_mfree(http_tcp_client_t *ptr)
+{
+    int res = http_tcp_client_free(ptr);
+    int local_errno = errno;
+    free(ptr);
+    errno = local_errno;
+    return res;
+}
+
 int http_client_free(http_client_t *obj)
 {
     http_client_task_data_free(&obj->task_data);
     stream_buff_free(&obj->in_stream);
     free((void *)obj->remote_address.ip_str);
-    close(obj->fd);
     return 0;
-}
-
-int http_client_mfree(http_client_t *ptr)
-{
-    int res = http_client_free(ptr);
-    int local_errno = errno;
-
-    free(ptr);
-    errno = local_errno;
-    return res;
 }
 
 int http_client_log_start_processing_time_update(http_client_t *obj)
@@ -429,15 +603,9 @@ int http_client_disconnect(http_client_t *obj)
 
     hc_list_node_purge(&obj->node);
 
-    http_client_mfree(obj);
+    http_client_mfree_vcall(obj);
 
     return 0;
-}
-
-int http_client_from_hc_event_handler_mfree(hc_event_handler_iface *obj)
-{
-    return http_client_mfree(
-        http_client_from_hc_event_handler_static_cast(obj));
 }
 
 int http_client_state_inited_to_inactive_change(http_client_t *obj)
@@ -748,28 +916,27 @@ int http_client_routine_sendall_set(http_client_t *obj,
     return 0;
 }
 
-int http_client_routine_sendall(http_client_t *obj, size_t quant,
-    int flags)
+int http_tcp_client_routine_sendall(http_tcp_client_t *obj, size_t quant)
 {
     size_t to_send;
     ssize_t sz;
 
-    http_client_debug_log(obj, SERVER_LOG_TRACE,
+    http_client_debug_log(&(*obj).client_base, SERVER_LOG_TRACE,
          "calling \"http_client_routine_sendall\"");
 
-    to_send = (*obj).task_data.sendall.remaining_sz < quant ?
-        (*obj).task_data.sendall.remaining_sz : quant;
+    to_send = (*obj).client_base.task_data.sendall.remaining_sz < quant ?
+        (*obj).client_base.task_data.sendall.remaining_sz : quant;
 
-    sz = send(obj->fd, (*obj).task_data.sendall.data_ref,
-        to_send, flags);
+    sz = send(obj->fd, (*obj).client_base.task_data.sendall.data_ref,
+        to_send, 0);
 
     if (sz == -1)
         return HTTP_CLIENT_ROUTINE_ERROR;
 
-    (*obj).task_data.sendall.remaining_sz -= sz;
-    (*obj).task_data.sendall.data_ref += sz;
+    (*obj).client_base.task_data.sendall.remaining_sz -= sz;
+    (*obj).client_base.task_data.sendall.data_ref += sz;
 
-    if ((*obj).task_data.sendall.remaining_sz == 0)
+    if ((*obj).client_base.task_data.sendall.remaining_sz == 0)
         return HTTP_CLIENT_ROUTINE_DONE;
 
     return HTTP_CLIENT_ROUTINE_IN_PROGRESS;
@@ -1099,7 +1266,7 @@ int http_client_task_response_get (http_client_t *obj)
     case HTTP_CLIENT_TASK_STATE_SENDALL:
 
         switch (http_client_routine_sendall(obj,
-            http_client_compute_quant(obj), 0))
+            http_client_compute_quant(obj)))
         {
             case HTTP_CLIENT_ROUTINE_DONE:
                 http_client_last_active_timestamp_update(obj);
@@ -1157,10 +1324,10 @@ int http_client_task_sendfile (http_client_t *obj)
     case HTTP_CLIENT_TASK_STATE_INITIAL:
     {
         ssize_t read_bytes;
-
+/*
         http_client_debug_log(obj, SERVER_LOG_TRACE, "transfering %d --> %d",
                     (*obj).task_data.task.send_file.fd, (*obj).fd);
-
+*/
         read_bytes = read((*obj).task_data.task.send_file.fd,
             (*obj).task_data.task.send_file.buff,
             (*obj).task_data.task.send_file.buff_sz);
@@ -1197,7 +1364,7 @@ int http_client_task_sendfile (http_client_t *obj)
     case HTTP_CLIENT_TASK_STATE_SENDALL:
 
         switch (http_client_routine_sendall(obj,
-                http_client_compute_quant(obj), 0))
+                http_client_compute_quant(obj)))
         {
             case HTTP_CLIENT_ROUTINE_DONE:
                 http_client_last_active_timestamp_update(obj);
@@ -1299,7 +1466,7 @@ int http_client_task_send_cte (http_client_t *obj)
         case HTTP_CLIENT_TASK_STATE_FINAL_ACTION:
 
             switch (http_client_routine_sendall(obj,
-                    http_client_compute_quant(obj), 0))
+                    http_client_compute_quant(obj)))
             {
                 case HTTP_CLIENT_ROUTINE_DONE:
                     http_client_last_active_timestamp_update(obj);
@@ -1384,7 +1551,7 @@ int http_client_task_response_error(http_client_t *obj)
          "calling \"http_client_task_response_error\"");
 
     switch (http_client_routine_sendall(obj,
-        http_client_compute_quant(obj), 0))
+        http_client_compute_quant(obj)))
     {
         case HTTP_CLIENT_ROUTINE_DONE:
             http_client_last_active_timestamp_update(obj);
@@ -1453,17 +1620,14 @@ int http_client_task_parse_request(http_client_t *obj)
 
         assert(stream_buff_bytes_to_read(&obj->in_stream) <= obj->in_stream.sz);
 
-        received_sz = recv(obj->fd, obj->in_stream.write_curr_ptr,
-            stream_buff_bytes_to_write(&obj->in_stream), 0);
-
-        http_client_debug_log(obj, SERVER_LOG_TRACE,
-            "receiving from %d", obj->fd);
+        received_sz = http_client_recv(obj, (*obj).in_stream.write_curr_ptr,
+            stream_buff_bytes_to_write(&(*obj).in_stream));
 
         if (received_sz == -1)
         {
             http_client_debug_log(obj, SERVER_LOG_TRACE, "recv: ERROR");
 
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == HTTP_CLIENT_RECV_ERRNO_EAGAIN)
             {
                 http_client_debug_log(obj, SERVER_LOG_TRACE,
                     "recv: EWOULDBLOCK");
@@ -1744,9 +1908,9 @@ int http_client_last_active_timestamp_update(http_client_t *obj)
     return 0;
 }
 
-void thunk_list_node_to_http_client_mfree(hc_list_node *ptr)
+void thunk_list_node_to_http_client_mfree_vcall(hc_list_node *ptr)
 {
-    http_client_mfree(http_client_from_hc_list_node_shift(ptr));
+    http_client_mfree_vcall(http_client_from_hc_list_node_shift(ptr));
 }
 
 int http_server_init(http_server_t *obj, server_config_t *conf,
@@ -1787,13 +1951,13 @@ int http_server_free(http_server_t *obj)
 {
     hc_list_for_each_node(hc_list_begin(&obj->active_clients),
         hc_list_end(&obj->active_clients),
-        thunk_list_node_to_http_client_mfree);
+        thunk_list_node_to_http_client_mfree_vcall);
 
     hc_list_destroy(&obj->active_clients);
 
     hc_list_for_each_node(hc_list_begin(&obj->inactive_clients),
         hc_list_end(&obj->inactive_clients),
-        thunk_list_node_to_http_client_mfree);
+        thunk_list_node_to_http_client_mfree_vcall);
 
     hc_list_destroy(&obj->inactive_clients);
 
@@ -1829,7 +1993,7 @@ int http_server_handle_event(http_server_t *serv, void *arg_ev)
     char client_addr_ip_str[INET6_ADDRSTRLEN];
     unsigned short client_addr_port;
     struct epoll_event event_buff;
-    http_client_t *client_buff;
+    http_tcp_client_t *client_buff;
     uint32_t ev = *(uint32_t *)arg_ev;
 
     http_server_debug_log(serv, SERVER_LOG_TRACE,
@@ -1841,7 +2005,7 @@ int http_server_handle_event(http_server_t *serv, void *arg_ev)
         return HTTP_EVENT_HANDLER_EXIT_CODE_FATAL_ERROR;
     }
 
-    if (!(client_buff = (http_client_t *)malloc(sizeof(http_client_t))))
+    if (!(client_buff = (http_tcp_client_t *)malloc(sizeof(http_tcp_client_t))))
         return HTTP_EVENT_HANDLER_EXIT_CODE_SUCCESS;
 
     accepted_fd = accept(serv->fd, (struct sockaddr *)&client_address,
@@ -1861,8 +2025,9 @@ int http_server_handle_event(http_server_t *serv, void *arg_ev)
         goto ERR_EXIT_ACCEPTED_FD;
     }
 
-    if (http_client_init(client_buff, accepted_fd, serv, client_addr_ip_str,
-        client_addr_port, SERVER_DEFAULT_KA_TIMEOUT_MSEC, REQUEST_BUFF_SZ))
+    if (http_tcp_client_init(client_buff, serv, client_addr_ip_str,
+        client_addr_port, SERVER_DEFAULT_KA_TIMEOUT_MSEC, REQUEST_BUFF_SZ,
+        accepted_fd))
     {
         local_errno = errno;
         free(client_buff);
@@ -1880,17 +2045,17 @@ int http_server_handle_event(http_server_t *serv, void *arg_ev)
         goto ERR_EXIT_CLIENT;
     }
 
-    http_client_state_inited_to_inactive_change(client_buff);
+    http_client_state_inited_to_inactive_change(&client_buff->client_base);
 
     http_server_debug_log(serv, SERVER_LOG_INFO, "\nClient %s:%hu connected"
         " (descriptor %d).",
-        (*client_buff).remote_address.ip_str,
-        (*client_buff).remote_address.port, client_buff->fd);
+        (*client_buff).client_base.remote_address.ip_str,
+        (*client_buff).client_base.remote_address.port, client_buff->fd);
 
     return HTTP_EVENT_HANDLER_EXIT_CODE_SUCCESS;
 
 ERR_EXIT_CLIENT:
-    http_client_mfree(client_buff);
+    http_tcp_client_mfree(client_buff);
 ERR_EXIT_ACCEPTED_FD:
     close(accepted_fd);
     errno = local_errno;
