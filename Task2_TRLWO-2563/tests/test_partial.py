@@ -1,20 +1,28 @@
-import sys, socket, time, re, threading as multi
+# -*- coding: utf-8 -*-
 
-ip, port, resource, part_timeout, recv_timeout, number_of_clients = sys.argv[1:]
+# TODO: as module; test units (different scenarios)
+# 
+
+import sys, socket, time, re, threading as multi, ssl
+
+conn_type, ip, port, resource, part_timeout, recv_timeout, number_of_clients = sys.argv[1:]
 
 port, part_timeout, recv_timeout, number_of_clients = int(port), \
     float(part_timeout), float(recv_timeout), int(number_of_clients)
 
 parts = ["G", "ET", " "] + list(resource) + [" H" ,"TTP/1", 
-		 ".1\r" "\nConnec" , "tion", " :  kEeP-", "alivE \r", 
-		 "\n  ", "  \r\n"]
+         ".1\r" "\nConnec" , "tion", " :  kEeP-", "alivE \r", 
+         "\n  ", "  \r\n"]
 
-def request_partial(seq_num):    
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
-    sock.connect((ip, port))
-    
+socket_wrapper = {"http" :lambda s: s, "https": lambda s: ssl.SSLSocket(s)}
+
+def request_partial(seq_num):
     try:
-        for part in parts :
+        sock = socket_wrapper[conn_type](socket.socket(socket.AF_INET, 
+                    socket.SOCK_STREAM, 0))
+        sock.connect((ip ,port))
+        
+        for part in parts:
             sock.sendall(part)              
             time.sleep(part_timeout)
         
@@ -61,17 +69,14 @@ def request_partial(seq_num):
         
         if remaining_to_receive: 
             raise Exception("not all received")
-
-    except Exception as e:
-        print "Client " + str(sock.getsockname()[1]) + " : " + e.message    
+    
+    except Exception as e: 
+        print "Client " + str(sock.getsockname()[1]) + " : " + e.message 
     
     sock.close()
 
 requestors = [multi.Thread(target = request_partial, args=(num,))
     for num in xrange(number_of_clients)]
 
-for each in requestors:
-    each.start()
-	
-for each in requestors:  
-    each.join()
+for each in requestors: each.start()
+for each in requestors: each.join()

@@ -1,7 +1,7 @@
 {
     "port" : "8081" ,
     "use_ssl" : false,
-    "root_path" : "tmp_root/"
+    "root_path" : "./"
     ,"logging" : ["ACCESS", "INFO", "TRACE", "FATAL"]
 //    ,"logging_out" : "stdout.log"
     //,"logging" : ["ACCESS"]

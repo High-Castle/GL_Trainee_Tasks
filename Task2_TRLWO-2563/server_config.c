@@ -289,10 +289,10 @@ ERR_EXIT:
 
 int server_config_free (server_config_t *ctx)
 {
-	if (ctx->logging_out && ctx->logging_out != stdout)
-		fclose(ctx->logging_out);
+    if (ctx->logging_out && ctx->logging_out != stdout)
+	fclose(ctx->logging_out);
 	
-	free((void *)ctx->file_name);
+    free((void *)ctx->file_name);
     free((void *)ctx->root_path);
     free(ctx->logging_mask);
     return 0;

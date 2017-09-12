@@ -1,0 +1,8 @@
+{
+    "port" : "8082" ,
+    "use_ssl" : false,
+    "root_path" : "./"
+    ,"logging" : ["ACCESS", "INFO", "TRACE", "FATAL"]
+//    ,"logging_out" : "stdout.log"
+    //,"logging" : ["ACCESS"]
+}
