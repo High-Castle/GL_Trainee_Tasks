@@ -98,12 +98,23 @@ static int wn_nl80211_ctx_free (wn_nl80211_ctx *obj)
 typedef struct wn_nl80211_sta_info_node
 {
     hc_list_node node;
-    unsigned char ssid[32];
+
+    
     unsigned char bssid[6];
-    int32_t rssi_dBm;
+    
+    int32_t rssi_100dBm;
     uint32_t frequency_MHz;
-    hc_list_t channel_list;
-    hc_list_t security_mode_list;
+    
+    struct {
+        struct {
+            unsigned char data[32];
+            size_t len;
+        } ssid;
+        hc_list_t channel_list;
+        hc_list_t security_mode_list;
+        
+    } ie;
+    
 } wn_nl80211_sta_info_node;
 
 
@@ -114,15 +125,9 @@ wn_nl80211_sta_info_node *
         wn_nl80211_sta_info_node, node)); 
 }
 
-
 static inline int wn_nl80211_sta_info_node_init_from_nl_msg(
     wn_nl80211_sta_info_node *obj, struct nl_msg *msg)
 {
-    // parsing 
-    // GET_STATION :
-    //  NL80211_ATTR_STA_SUPPORTED_RATES
-    //  NL80211_ATTR_STA_SUPPORTED_CHANNLES
-    // NL80211_ATTR_SCAN 
     struct genlmsghdr *gnlh;
     struct nlattr *root[NL80211_ATTR_MAX + 1]; /* at 0 */
     struct nlattr *bss_root[NL80211_BSS_MAX + 1]; 
@@ -136,33 +141,39 @@ static inline int wn_nl80211_sta_info_node_init_from_nl_msg(
     
     nla_parse_nested(bss_root, NL80211_BSS_MAX/*top*/, 
         root[NL80211_ATTR_BSS], NULL);
+    
     //memcpy(obj->ssid, nla_data(bss[NL80211_BSS_SSID]), sizeof(obj->bssid))
-    * obj = (wn_nl80211_sta_info_node){ 0 };
+    
+    *obj = (wn_nl80211_sta_info_node){ 0 };
+    
+    //ssid_cpy( , );
     
     memcpy(obj->bssid, nla_data(bss_root[NL80211_BSS_BSSID]), 
         sizeof(obj->bssid));
     
     obj->frequency_MHz = nla_get_u32(bss_root[NL80211_BSS_FREQUENCY]);
-    obj->rssi_dBm = nla_get_s32(bss_root[NL80211_BSS_SIGNAL_MBM]);
+    obj->rssi_100dBm = nla_get_s32(bss_root[NL80211_BSS_SIGNAL_MBM]);
+ 
     
-    hc_list_init(&obj->channel_list);
-    hc_list_init(&obj->security_mode_list);
+       
+    hc_list_init(&obj->ie.channel_list);
+    hc_list_init(&obj->ie.security_mode_list);
     return 0;
 }
 
 static inline 
     int wn_nl80211_sta_info_node_free(wn_nl80211_sta_info_node *obj)
 {
-    hc_list_for_each_node(hc_list_begin(&obj->security_mode_list), 
-        hc_list_end(&obj->security_mode_list),
+    hc_list_for_each_node(hc_list_begin(&obj->ie.security_mode_list), 
+        hc_list_end(&obj->ie.security_mode_list),
         hc_list_int_node_from_hc_list_node_mfree_thunk);
         
-    hc_list_for_each_node(hc_list_begin(&obj->channel_list), 
-        hc_list_end(&obj->channel_list),
+    hc_list_for_each_node(hc_list_begin(&obj->ie.channel_list), 
+        hc_list_end(&obj->ie.channel_list),
         hc_list_int_node_from_hc_list_node_mfree_thunk);
     
-    hc_list_destroy(&obj->security_mode_list);
-    hc_list_destroy(&obj->channel_list);
+    hc_list_destroy(&obj->ie.security_mode_list);
+    hc_list_destroy(&obj->ie.channel_list);
     
     return 0;
 }
@@ -209,7 +220,8 @@ int wn_p_nl80211_scan_ctx_free(wn_p_nl80211_scan_ctx *obj)
 typedef struct wn_nl80211_scan_param_t
 {
     hc_list_t frequency_list;
-    hc_list_t ssid_list;          
+    hc_list_t ssid_list;    
+    // TODO: bssid_list      
 } wn_nl80211_scan_param_t;
 
 
@@ -375,7 +387,7 @@ static int wn_nl80211_scan_perform(wn_nl80211_ctx *obj, const char *iface,
     
     /* @NL80211_ATTR_SCAN_SSIDS: *nested* attribute with SSIDs, leave out for passive
      *	scanning and include a zero-length SSID (wildcard(.?)) for wildcard scan */
-    /*
+    
     if (!hc_list_empty(&param->ssid_list))
     {
         struct nl_msg *ssid_attr_msg = nlmsg_alloc();
@@ -413,6 +425,7 @@ static int wn_nl80211_scan_perform(wn_nl80211_ctx *obj, const char *iface,
     {
         struct nl_msg *freq_attr_msg = nlmsg_alloc();
         size_t idx;
+    
         if (!freq_attr_msg)
             goto ERR_EXIT_CB_PTR;
         
@@ -530,68 +543,23 @@ ERR_EXIT:
 }
 
 
-typedef struct wn_p_nl80211_nlcallback_scan_ctx
-{
-    void *data;
-    int (*callback)(wn_nl80211_sta_info_node *, void *);
-} wn_p_nl80211_nlcallback_scan_ctx;
-
-
-static inline int wn_p_nl80211_nlcallback_scan_ctx_init(
-    wn_p_nl80211_nlcallback_scan_ctx *obj, 
-    int (*callback)(wn_nl80211_sta_info_node *, void *), void *data)
-{
-    obj->data = data;
-    obj->callback = callback;
-    return 0;
-}
-
-static int wn_p_nl80211_nlcallback_scan_ctx_free(
-    wn_p_nl80211_nlcallback_scan_ctx *ctx)
-{
-    return 0;
-}
-
-// will unblock after NLMSG_DONE is reached (in multipart response)
-// (all messages are skipped and on the last, default handler will return NL_STOP)
-inline static int 
-    wn_p_nl80211_nlcallback_scan_get_info(struct nl_msg *msg, void *data)
-{
-    wn_nl80211_sta_info_node *node;
-    wn_p_nl80211_nlcallback_scan_ctx *ctx 
-        = (wn_p_nl80211_nlcallback_scan_ctx *)data;
-    
-    if (!(node = malloc(sizeof(wn_nl80211_sta_info_node))))
-        return -1;
-    
-    wn_nl80211_sta_info_node_init_from_nl_msg(node, msg);
-        
-    return ctx->callback(node, ctx->data); // call transfers the ownership of 
-                                           // the node to callback; should return NL_*(STOP..SKIP, etc)
-}
-
-
-
 // TODO: revise err. han.
 int wn_nl80211_scan_get_ssid_info(wn_nl80211_ctx *ctx, const char *iface,
-    int (*func)(wn_nl80211_sta_info_node *, void *), void *arg)
+    int (*func)(struct nl_msg *, void *), void *arg)
 {
     int err;
-    
-    wn_p_nl80211_nlcallback_scan_ctx scan_ctx;
+
     uint32_t iface_id;
     struct nl_cb *cb_ptr;
     struct nl_msg *req_msg;
     
     err = 0;
-    
-    wn_p_nl80211_nlcallback_scan_ctx_init(&scan_ctx, func, arg);
-    
+        
     if (!(iface_id = if_nametoindex(iface))) // 0 return on error
-    	goto ERR_EXIT_WN_P_NL80211_NLCALLBACK_SCAN_CTX;
+    	goto ERR_EXIT;
     
     if (!(req_msg = nlmsg_alloc()))
-        goto ERR_EXIT_WN_P_NL80211_NLCALLBACK_SCAN_CTX;
+        goto ERR_EXIT;
     
     if (!(cb_ptr = nl_cb_alloc(NL_CB_DEFAULT)))
         goto ERR_EXIT_NL_MSG;
@@ -625,8 +593,7 @@ int wn_nl80211_scan_get_ssid_info(wn_nl80211_ctx *ctx, const char *iface,
         goto ERR_EXIT_CB_PTR;
     }
 
-    if ((err = nl_cb_set(cb_ptr, NL_CB_VALID, NL_CB_CUSTOM, 
-        wn_p_nl80211_nlcallback_scan_get_info, &scan_ctx)))
+    if ((err = nl_cb_set(cb_ptr, NL_CB_VALID, NL_CB_CUSTOM, func, arg)))
     {
         fprintf(stderr, "\n%d, nl_cb_set: %d (%s)",__LINE__, err, 
             nl_geterror(-err));
@@ -664,8 +631,7 @@ int wn_nl80211_scan_get_ssid_info(wn_nl80211_ctx *ctx, const char *iface,
     
     nl_socket_drop_membership(ctx->sock, ctx->grp_id.scan);
     nl_cb_put(cb_ptr);
-    wn_p_nl80211_nlcallback_scan_ctx_free(&scan_ctx);   
-    
+
     return 0;
 
 ERR_EXIT_SCAN_MEMBERSHIP:
@@ -674,27 +640,29 @@ ERR_EXIT_CB_PTR:
     nl_cb_put(cb_ptr);
 ERR_EXIT_NL_MSG:
     if (req_msg) nlmsg_free(req_msg);
-ERR_EXIT_WN_P_NL80211_NLCALLBACK_SCAN_CTX:
-    wn_p_nl80211_nlcallback_scan_ctx_free(&scan_ctx);    
+ERR_EXIT:
     return -1;
 }
 
 #define BSSID_MAXHEX_STRLEN 17
 
-int print_sta_info (wn_nl80211_sta_info_node *ctx, void *arg)
+// will unblock after NLMSG_DONE is reached (in multipart response)
+// (all messages are skipped and on the last, default handler will return NL_STOP)
+inline static int 
+    print_sta_info(struct nl_msg *msg, void *data)
 {
-    ((void)ctx, (void)arg);
+    wn_nl80211_sta_info_node node;
+    wn_nl80211_sta_info_node_init_from_nl_msg(&node, msg);
     
-    //fprintf(stderr, "\nSTA info received");
-    // to stdout
-    fprintf(stderr, "\n%.2hhx:%.2hhx:%.2hhx:%.2hhx:%.2hhx:%.2hhx" 
-           " %d %u", ctx->bssid[0], ctx->bssid[1], ctx->bssid[2], ctx->bssid[3],
-           ctx->bssid[4], ctx->bssid[5], ctx->rssi_dBm, ctx->frequency_MHz);   
-       
-    wn_nl80211_sta_info_node_mfree(ctx);
+    fprintf(stdout, "\n%.2hhx:%.2hhx:%.2hhx:%.2hhx:%.2hhx:%.2hhx" 
+           " %d %u", node.bssid[0], node.bssid[1], node.bssid[2], node.bssid[3],
+           node.bssid[4], node.bssid[5], node.rssi_100dBm, node.frequency_MHz);   
+           
+    wn_nl80211_sta_info_node_free(&node);   
     
-    return NL_SKIP; // it doesn't matter NL_OK or NL_SKIP since it would be the 
-                    // last hook called (lowest prio) 
+    return NL_OK; // call transfers the ownership of 
+                                           // the node to callback; should return NL_*(STOP..SKIP, etc)
+                                          // it doesn't matter NL_OK or NL_SKIP since it would be the // last hook called (lowest prio) 
 }
 
 int main (int arg_n, const char *(args[]))
