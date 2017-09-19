@@ -23,11 +23,17 @@
 // https://github.com/Robpol86/libnl/blob/master/example_c/scan_access_points.c
 // https://git.kernel.org/pub/scm/linux/kernel/git/jberg/iw.git/tree/scan.c
 
-typedef struct decimal_char_t
+typedef struct wn_p_decimal_char_t
 {
     unsigned char integer;
     unsigned char decimal;
-} decimal_char_t;
+} wn_p_decimal_char_t;
+
+typedef struct wn_data_with_len_t
+{
+    unsigned char *data;
+    size_t len;
+} wn_data_with_len_t;
 
 // TODO: add timeout
 typedef struct hc_list_int_node
@@ -48,7 +54,8 @@ static inline hc_list_int_node *hc_list_int_node_from_hc_list_node_shift(
     return (hc_list_int_node *)((char *)obj - offsetof(hc_list_int_node, node));
 }
 
-static inline void hc_list_int_node_from_hc_list_node_mfree_thunk(hc_list_node *obj)
+static inline void hc_list_int_node_from_hc_list_node_mfree_thunk(
+    hc_list_node *obj)
 {
     hc_list_int_node *int_node
         = hc_list_int_node_from_hc_list_node_shift(obj);
@@ -110,29 +117,21 @@ typedef struct wn_nl80211_sta_info_node
     int32_t rssi_100dBm;
     uint32_t frequency_MHz;
 
-    struct {
+    struct wn_nl80211_sta_info_node_ie {
         struct {
             unsigned char data[32];
             size_t len;
         } ssid;
+        
+        wn_data_with_len_t channels;
+        wn_data_with_len_t security_modes;
 
         struct {
-            unsigned char data[256];
-            size_t len;
-        } channels;
-
-        struct {
-            unsigned char data[256];
-            size_t len;
-        } security_modes;
-
-        struct {
-            decimal_char_t data[36];
+            wn_p_decimal_char_t *data;
             size_t elem_num;
         } rates_Mbps;
-
-        // TODO: beacon or probe response (see nl80211.h)
     } ie;
+    
 } wn_nl80211_sta_info_node;
 
 
@@ -158,9 +157,9 @@ enum
 };
 
 // 80211-wireless-networks (book, chapter 4)
-decimal_char_t wn_p_rate_parse_byte (unsigned char byte, int *is_mantadory)
+wn_p_decimal_char_t wn_p_rate_parse_byte (unsigned char byte, int *is_mantadory)
 {
-    static decimal_char_t table [] = {
+    static wn_p_decimal_char_t table [] = {
         [2] = {1,0}, [4] = {2,0}, [11] = {5,5}, [12] = {6,0},
         [18] = {9,0}, [22] = {11,0}, [24] = {12,0}, [36] = {18,0},
         [44] = {22,0}, [48] = {24,0}, [66] = {33,0}, [72] = {46,0},
@@ -172,11 +171,16 @@ decimal_char_t wn_p_rate_parse_byte (unsigned char byte, int *is_mantadory)
     return table[byte & ~(1 << (CHAR_BIT - 1))];
 }
 
-static inline int wn_nl80211_sta_info_node_ie_fill(wn_nl80211_sta_info_node *obj,
-    const unsigned char *const data, const size_t len)
+static inline int wn_nl80211_sta_info_node_ie_init(
+    struct wn_nl80211_sta_info_node_ie *obj, const unsigned char *const data, 
+    const size_t len)
 {
     const unsigned char *it = data, *const data_r_bound = data + len;
-
+    
+    obj->channels.data = NULL;
+    obj->security_modes.data = NULL;
+    obj->rates_Mbps.data = NULL;
+    
     for (;;)
     {
         const unsigned char *it_data;
@@ -192,21 +196,26 @@ static inline int wn_nl80211_sta_info_node_ie_fill(wn_nl80211_sta_info_node *obj
         switch (it[WN_NL80211_IE_OFFSET_TYPE])
         {
         case WN_NL80211_IE_TYPE_SSID:
-
-            (*obj).ie.ssid.len
-                = (it[WN_NL80211_IE_OFFSET_LEN] > sizeof((*obj).ie.ssid.data) ?
-                    sizeof((*obj).ie.ssid.data) : (size_t)it[WN_NL80211_IE_OFFSET_LEN]);
-
-            memcpy((*obj).ie.ssid.data, it_data, (*obj).ie.ssid.len);
+            (*obj).ssid.len
+                = (it[WN_NL80211_IE_OFFSET_LEN] > sizeof((*obj).ssid.data) ?
+                    sizeof((*obj).ssid.data) : (size_t)it[WN_NL80211_IE_OFFSET_LEN]);
+            
+            memcpy((*obj).ssid.data, it_data, (*obj).ssid.len);
             break;
 
         case WN_NL80211_IE_TYPE_RATES:
 
-            (*obj).ie.rates_Mbps.elem_num = it[WN_NL80211_IE_OFFSET_LEN];
-
-            for (size_t idx = 0; idx != (*obj).ie.rates_Mbps.elem_num; ++idx)
+            obj->rates_Mbps.elem_num = it[WN_NL80211_IE_OFFSET_LEN];
+            
+            if (!(obj->rates_Mbps.data 
+               = malloc(obj->rates_Mbps.elem_num * sizeof(wn_p_decimal_char_t))))
             {
-                (*obj).ie.rates_Mbps.data[idx]
+                goto ERR_EXIT_FREE;    
+            }
+            
+            for (size_t idx = 0; idx != (*obj).rates_Mbps.elem_num; ++idx)
+            {
+                (*obj).rates_Mbps.data[idx]
                     = wn_p_rate_parse_byte(it_data[idx], &(int){0});
             }
 
@@ -216,15 +225,28 @@ static inline int wn_nl80211_sta_info_node_ie_fill(wn_nl80211_sta_info_node *obj
             printf("\nGGGGG\n");
 
             break;
-
         }
 
         it = it_data + it[WN_NL80211_IE_OFFSET_LEN];
     }
     return 0;
+    
+ERR_EXIT_FREE:
+    free(obj->rates_Mbps.data);    
+    free(obj->security_modes.data);  
+    free(obj->channels.data);
+    return -1;
 }
 
 
+static inline int wn_nl80211_sta_info_node_ie_free(
+    struct wn_nl80211_sta_info_node_ie *obj)
+{
+    free(obj->rates_Mbps.data);    
+    free(obj->security_modes.data);  
+    free(obj->channels.data);
+    return 0;
+}
 
 static inline int wn_nl80211_sta_info_node_from_nl_msg_init(
     wn_nl80211_sta_info_node *obj, struct nl_msg *msg)
@@ -266,12 +288,7 @@ static inline int wn_nl80211_sta_info_node_from_nl_msg_init(
         return -1;
     }
 
-    obj->ie.ssid.len = 0;
-    obj->ie.channels.len = 0;
-    obj->ie.security_modes.len = 0;
-    obj->ie.rates_Mbps.elem_num = 0;
-
-    if (wn_nl80211_sta_info_node_ie_fill(obj,
+    if (wn_nl80211_sta_info_node_ie_init(&obj->ie,
         nla_data(bss_root[ie_attr_offset]),
         nla_len(bss_root[ie_attr_offset])))
     {
@@ -286,7 +303,7 @@ ERR_EXIT:
 
 static inline int wn_nl80211_sta_info_node_free(wn_nl80211_sta_info_node *obj)
 {
-    ((void)obj);
+    wn_nl80211_sta_info_node_ie_free(&obj->ie);
     return 0;
 }
 
@@ -495,29 +512,28 @@ static int wn_nl80211_scan_perform(wn_nl80211_ctx *obj, const char *iface,
     }
 
 //XXX: start review here
-
+    
     /* @NL80211_ATTR_SCAN_SSIDS: *nested* attribute with SSIDs, leave out for passive
      *	scanning and include a zero-length SSID (wildcard(.?)) for wildcard scan */
+    ((void)param);
+    /* // TODO: params
     if (!hc_list_empty(&param->ssid_list))
     {
         struct nl_msg *ssid_attr_msg;
-        size_t idx;
 
         if (!(ssid_attr_msg = nlmsg_alloc()))
             goto ERR_EXIT_CB_PTR;
 
-        idx = 1;
-
+ 
         for (hc_list_node *curr = hc_list_begin(&param->ssid_list);
             curr != hc_list_end(&param->ssid_list);
-            curr = hc_list_node_next(curr), ++idx)
+            curr = hc_list_node_next(curr))
         {
             hc_list_int_node *node
                 = hc_list_int_node_from_hc_list_node_shift(curr);
-
-	        if ((err = nla_put(ssid_attr_msg,
-	            idx, node->data.sz,
-	            node->suffix)))
+            //fprintf(stdout, "\n%.*s\n", node->data.sz, node->suffix);
+	        if ((err = nla_put(ssid_attr_msg, NL80211_SCHED_SCAN_MATCH_ATTR_SSID, 
+	            node->data.sz, node->suffix)))
             {
 	            nlmsg_free(ssid_attr_msg);
                 goto ERR_EXIT_CB_PTR;
@@ -537,21 +553,18 @@ static int wn_nl80211_scan_perform(wn_nl80211_ctx *obj, const char *iface,
     if (!hc_list_empty(&param->frequency_list))
     {
         struct nl_msg *freq_attr_msg = nlmsg_alloc();
-        size_t idx;
-
+        
         if (!freq_attr_msg)
             goto ERR_EXIT_CB_PTR;
 
-
-        idx = 0;
         for (hc_list_node *curr = hc_list_begin(&param->frequency_list);
             curr != hc_list_end(&param->frequency_list);
-            curr = hc_list_node_next(curr), ++idx)
+            curr = hc_list_node_next(curr))
         {
             hc_list_int_node *node
                 = hc_list_int_node_from_hc_list_node_shift(curr);
 
-	        if ((err = nla_put_u32(freq_attr_msg, idx,
+	        if ((err = nla_put_u32(freq_attr_msg, 1,
 	            (uint32_t)node->data.ui)))
             {
 	            nlmsg_free(freq_attr_msg);
@@ -780,7 +793,7 @@ inline static int
         node.bssid[3], node.bssid[4], node.bssid[5], node.rssi_100dBm / 100. ,
         node.frequency_MHz, (int)node.ie.ssid.len, node.ie.ssid.data);
 
-    if (node.ie.rates_Mbps.elem_num != 0)
+    if (node.ie.rates_Mbps.data)
     {
         size_t idx;
 
