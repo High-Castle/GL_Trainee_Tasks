@@ -19,6 +19,14 @@
 
 #include "hc_list.h"
 
+#ifdef WN_DEBUG
+#   undef WN_DEBUG
+#   define WN_DEBUG(...) fprintf(__VA_ARGS__)
+#else
+#   define WN_DEBUG(...)
+#endif
+
+// References: (TODO: extend)
 // http://www.infradead.org/~tgr/libnl/doc/api/nl_8c_source.html#l00469
 // https://github.com/Robpol86/libnl/blob/master/example_c/scan_access_points.c
 // https://git.kernel.org/pub/scm/linux/kernel/git/jberg/iw.git/tree/scan.c
@@ -124,12 +132,19 @@ typedef struct wn_nl80211_sta_info_node
         } ssid;
         
         wn_data_with_len_t channels;
-        wn_data_with_len_t security_modes;
-
+        
+        hc_list_t auth_cipher_suits;
+        hc_list_t pairwise_cipher_suits;
+        
         struct {
             wn_p_decimal_char_t *data;
             size_t elem_num;
         } rates_Mbps;
+        
+        struct {
+            unsigned char data[4];
+            unsigned char inited;
+        } group_cipher_suite;
     } ie;
     
 } wn_nl80211_sta_info_node;
@@ -142,20 +157,10 @@ wn_nl80211_sta_info_node *
         wn_nl80211_sta_info_node, node));
 }
 
-enum
-{
-   WN_NL80211_IE_OFFSET_TYPE = 0u,
-   WN_NL80211_IE_OFFSET_LEN,
-   WN_NL80211_IE_OFFSET_DATA
-};
 
-enum
-{
-    WN_NL80211_IE_TYPE_SSID = 0,
-    WN_NL80211_IE_TYPE_RATES = 1,
-    WN_NL80211_IE_TYPE_CHANNELS = 36,
-};
 
+
+// OUI - 
 // 80211-wireless-networks (book, chapter 4)
 wn_p_decimal_char_t wn_p_rate_parse_byte (unsigned char byte, int *is_mantadory)
 {
@@ -175,37 +180,59 @@ static inline int wn_nl80211_sta_info_node_ie_init(
     struct wn_nl80211_sta_info_node_ie *obj, const unsigned char *const data, 
     const size_t len)
 {
+    enum
+    {
+        IE_TYPE_SSID = 0,
+        IE_TYPE_RATES = 1,
+        IE_TYPE_CHANNELS = 36,
+        IE_TYPE_RSN = 48
+    };
+    
+    enum
+    {
+        IE_OFFSET_TYPE = 0u,
+        IE_OFFSET_LEN,
+        IE_OFFSET_DATA
+    };
+
+    enum 
+    {
+        IE_CIPHER_SELECTOR_LEN = 4
+    };
+    
     const unsigned char *it = data, *const data_r_bound = data + len;
     
     obj->channels.data = NULL;
-    obj->security_modes.data = NULL;
+    hc_list_init(&obj->auth_cipher_suits);
+    hc_list_init(&obj->pairwise_cipher_suits);
     obj->rates_Mbps.data = NULL;
+    obj->group_cipher_suite.inited = 0;
     
     for (;;)
     {
         const unsigned char *it_data;
 
-        if (data_r_bound - it < WN_NL80211_IE_OFFSET_DATA)
+        if (data_r_bound - it < IE_OFFSET_DATA)
             break;
 
-        it_data = it + WN_NL80211_IE_OFFSET_DATA;
+        it_data = it + IE_OFFSET_DATA;
 
-        if (it[WN_NL80211_IE_OFFSET_LEN] > data_r_bound - it_data)
+        if (it[IE_OFFSET_LEN] > data_r_bound - it_data)
             break;
 
-        switch (it[WN_NL80211_IE_OFFSET_TYPE])
+        switch (it[IE_OFFSET_TYPE])
         {
-        case WN_NL80211_IE_TYPE_SSID:
+        case IE_TYPE_SSID:
             (*obj).ssid.len
-                = (it[WN_NL80211_IE_OFFSET_LEN] > sizeof((*obj).ssid.data) ?
-                    sizeof((*obj).ssid.data) : (size_t)it[WN_NL80211_IE_OFFSET_LEN]);
+                = (it[IE_OFFSET_LEN] > sizeof((*obj).ssid.data) ?
+                    sizeof((*obj).ssid.data) : (size_t)it[IE_OFFSET_LEN]);
             
             memcpy((*obj).ssid.data, it_data, (*obj).ssid.len);
             break;
 
-        case WN_NL80211_IE_TYPE_RATES:
+        case IE_TYPE_RATES:
 
-            obj->rates_Mbps.elem_num = it[WN_NL80211_IE_OFFSET_LEN];
+            obj->rates_Mbps.elem_num = it[IE_OFFSET_LEN];
             
             if (!(obj->rates_Mbps.data 
                = malloc(obj->rates_Mbps.elem_num * sizeof(wn_p_decimal_char_t))))
@@ -220,20 +247,132 @@ static inline int wn_nl80211_sta_info_node_ie_init(
             }
 
             break;
-        case WN_NL80211_IE_TYPE_CHANNELS:
 
-            printf("\nGGGGG\n");
-
-            break;
+        case IE_TYPE_RSN:
+            {
+                enum
+                {
+                    RSN_MIN_SIZE = 14,
+                    
+                    RSN_VERSION_SZ = 2,
+                    RSN_CIPHER_COUNT_SZ = 2,
+                    RSN_CIPHER_SELECTOR_SZ = 4,
+                };
+                
+                size_t selector_arr_sz;   
+                const unsigned char *field_it, *ie_r_bound;
+                
+                if (it[IE_OFFSET_LEN] < RSN_MIN_SIZE)
+                    goto ERR_EXIT_FREE;
+                
+                ie_r_bound = it_data + it[IE_OFFSET_LEN];
+                field_it = it_data + RSN_VERSION_SZ;
+                
+                memcpy(obj->group_cipher_suite.data, field_it, 
+                    RSN_CIPHER_SELECTOR_SZ);
+                
+                obj->group_cipher_suite.inited = 1;
+                
+                field_it += RSN_CIPHER_SELECTOR_SZ;
+                
+                /*
+                The MAC protocol data units (MPDUs) or frames in the MAC 
+                sublayer are described as a sequence of fields in specific 
+                order. Each figure in Clause 7 depicts the fields/subfields as 
+                they appear in the MAC frame and in the order in which they are 
+                passed to the physical layer convergence protocol (PLCP), from
+                left to right. In figures, all bits within fields are numbered, 
+                from 0 to k, where the length of the field is k+1 bit. The
+                octet boundaries within a field can be obtained by taking the 
+                bit numbers of the field modulo 8. Octets within numeric fields 
+                that are longer than a single octet are depicted in increasing 
+                order of significance, from lowest numbered bit to highest 
+                numbered bit. The octets in fields longer than a single octet 
+                are sent to the PLCP in order from the octet containing the 
+                lowest numbered bits to the octet containing the highest 
+                numbered bits. (Byte order considered little-endian)
+                */
+                
+                selector_arr_sz = (field_it[0] | (field_it[1] << 8)) 
+                    * RSN_CIPHER_SELECTOR_SZ; // promoted to int
+                
+                field_it += RSN_CIPHER_COUNT_SZ;
+                
+                if (selector_arr_sz + RSN_CIPHER_COUNT_SZ 
+                    > (size_t)(ie_r_bound - field_it))
+                {
+                    goto ERR_EXIT_FREE;
+                }
+                
+                for (const unsigned char *r_bound = field_it + selector_arr_sz; 
+                    field_it != r_bound; field_it += RSN_CIPHER_SELECTOR_SZ)
+                {                
+                    hc_list_int_node *node;
+                    
+                    if (!(node = malloc(sizeof(hc_list_int_node) 
+                        + RSN_CIPHER_SELECTOR_SZ)))
+                    {
+                        goto ERR_EXIT_FREE;
+                    }
+                    
+                    node->data.sz = RSN_CIPHER_SELECTOR_SZ;    
+                    
+                    memcpy(node->suffix, field_it, node->data.sz);    
+                    
+                    hc_list_node_insert_before(
+                        hc_list_end(&obj->pairwise_cipher_suits), &node->node);
+                }
+                                
+                selector_arr_sz = (field_it[0] | (field_it[1] << 8)) 
+                    * RSN_CIPHER_SELECTOR_SZ;
+                
+                field_it += RSN_CIPHER_COUNT_SZ;
+                
+                if ((size_t)(ie_r_bound - field_it) < selector_arr_sz)
+                {
+                    goto ERR_EXIT_FREE;
+                }
+                
+                for (const unsigned char *r_bound = field_it + selector_arr_sz; 
+                    field_it != r_bound; field_it += RSN_CIPHER_SELECTOR_SZ)
+                {                
+                    hc_list_int_node *node;
+                    
+                    if (!(node = malloc(sizeof(hc_list_int_node) 
+                        + RSN_CIPHER_SELECTOR_SZ)))
+                    {
+                        goto ERR_EXIT_FREE;
+                    }
+                    
+                    node->data.sz = RSN_CIPHER_SELECTOR_SZ;
+                    
+                    memcpy(node->suffix, field_it, node->data.sz);
+                    
+                    hc_list_node_insert_before(
+                        hc_list_end(&obj->auth_cipher_suits), &node->node);
+                }
+                
+                break;
+            }
         }
 
-        it = it_data + it[WN_NL80211_IE_OFFSET_LEN];
+        it = it_data + it[IE_OFFSET_LEN];
     }
+    
     return 0;
     
 ERR_EXIT_FREE:
-    free(obj->rates_Mbps.data);    
-    free(obj->security_modes.data);  
+    hc_list_for_each_node(hc_list_begin(&obj->pairwise_cipher_suits),
+        hc_list_end(&obj->pairwise_cipher_suits),
+        hc_list_int_node_from_hc_list_node_mfree_thunk);
+    
+    hc_list_for_each_node(hc_list_begin(&obj->auth_cipher_suits),
+        hc_list_end(&obj->auth_cipher_suits),
+        hc_list_int_node_from_hc_list_node_mfree_thunk);
+
+    free(obj->rates_Mbps.data);   
+    hc_list_destroy(&obj->pairwise_cipher_suits);  
+    hc_list_destroy(&obj->auth_cipher_suits);  
     free(obj->channels.data);
     return -1;
 }
@@ -242,8 +381,17 @@ ERR_EXIT_FREE:
 static inline int wn_nl80211_sta_info_node_ie_free(
     struct wn_nl80211_sta_info_node_ie *obj)
 {
-    free(obj->rates_Mbps.data);    
-    free(obj->security_modes.data);  
+    hc_list_for_each_node(hc_list_begin(&obj->pairwise_cipher_suits),
+        hc_list_end(&obj->pairwise_cipher_suits),
+        hc_list_int_node_from_hc_list_node_mfree_thunk);
+    
+    hc_list_for_each_node(hc_list_begin(&obj->auth_cipher_suits),
+        hc_list_end(&obj->auth_cipher_suits),
+        hc_list_int_node_from_hc_list_node_mfree_thunk);
+
+    free(obj->rates_Mbps.data);   
+    hc_list_destroy(&obj->pairwise_cipher_suits);  
+    hc_list_destroy(&obj->auth_cipher_suits);  
     free(obj->channels.data);
     return 0;
 }
@@ -251,6 +399,7 @@ static inline int wn_nl80211_sta_info_node_ie_free(
 static inline int wn_nl80211_sta_info_node_from_nl_msg_init(
     wn_nl80211_sta_info_node *obj, struct nl_msg *msg)
 {
+    int err;
     struct genlmsghdr *gnlh;
     int ie_attr_offset;
     struct nlattr *root[NL80211_ATTR_MAX + 1]; /* at 0 */
@@ -260,10 +409,21 @@ static inline int wn_nl80211_sta_info_node_from_nl_msg_init(
 
     /* TODO: validate */
 
-    nla_parse(root, NL80211_ATTR_MAX /*max size of attrs*/,
-        genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL);
+    if ((err = nla_parse(root, NL80211_ATTR_MAX /*max size of attrs*/,
+        genlmsg_attrdata(gnlh, 0), genlmsg_attrlen(gnlh, 0), NULL)))
+    {
+        WN_DEBUG(stderr, "\n%d, nla_parse: %d (%s)",__LINE__, err,
+                nl_geterror(-err));
+        return -1;
+    }
 
-    nla_parse_nested(bss_root, NL80211_BSS_MAX, root[NL80211_ATTR_BSS], NULL);
+    if ((err = nla_parse_nested(bss_root, NL80211_BSS_MAX, 
+        root[NL80211_ATTR_BSS], NULL)))
+    {
+        WN_DEBUG(stderr, "\n%d, nla_parse_nested: %d (%s)",__LINE__, err,
+                nl_geterror(-err));
+        return -1;    
+    }
 
     // *obj = (wn_nl80211_sta_info_node){ 0 };
 
@@ -289,7 +449,7 @@ static inline int wn_nl80211_sta_info_node_from_nl_msg_init(
     }
 
     if (wn_nl80211_sta_info_node_ie_init(&obj->ie,
-        nla_data(bss_root[ie_attr_offset]),
+        (unsigned char *)nla_data(bss_root[ie_attr_offset]),
         nla_len(bss_root[ie_attr_offset])))
     {
         goto ERR_EXIT;
@@ -426,18 +586,18 @@ int wn_p_nl80211_scan_callback_valid(struct nl_msg *msg, void *arg)
     wn_p_nl80211_scan_ctx *ctx = (wn_p_nl80211_scan_ctx *) arg;
     struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
 
-    fprintf(stderr , "\n%d calling %s", __LINE__, __func__);
+    WN_DEBUG(stderr , "\n%d calling %s", __LINE__, __func__);
 
     switch(gnlh->cmd)
     {
         case NL80211_CMD_NEW_SCAN_RESULTS:
             ctx->is_done = 1;
-            fprintf(stderr, "\nNL80211_CMD_NEW_SCAN_RESULTS received");
+            WN_DEBUG(stderr, "\nNL80211_CMD_NEW_SCAN_RESULTS received");
             break;
         case NL80211_CMD_SCAN_ABORTED:
             ctx->is_aborted = 1;
             ctx->is_done = 1;
-            fprintf(stderr, "\nNL80211_CMD_SCAN_ABORTED received");
+            WN_DEBUG(stderr, "\nNL80211_CMD_SCAN_ABORTED received");
             break;
     }
 
@@ -448,7 +608,7 @@ int wn_p_nl80211_scan_callback_multipart_end(struct nl_msg *msg, void *arg)
 {
     wn_p_nl80211_scan_ctx *ctx = (wn_p_nl80211_scan_ctx *) arg;
     ((void)msg);
-    fprintf(stderr , "\n%d calling %s", __LINE__, __func__);
+    WN_DEBUG(stderr , "\n%d calling %s", __LINE__, __func__);
     ctx->is_done = 1;
     return NL_STOP; //
 }
@@ -456,7 +616,7 @@ int wn_p_nl80211_scan_callback_multipart_end(struct nl_msg *msg, void *arg)
 int wn_p_nl80211_scan_callback_seq_check_noop(struct nl_msg *msg, void *arg)
 {
     ((void)msg,(void)arg);
-    fprintf(stderr , "\n%d calling %s", __LINE__, __func__);
+    WN_DEBUG(stderr , "\n%d calling %s", __LINE__, __func__);
     return NL_OK;
 }
 
@@ -467,7 +627,7 @@ int wn_p_nl80211_scan_callback_handle_error(struct sockaddr_nl *addr,
 
     ((void)addr);
 
-    fprintf(stderr , "\n%d calling %s", __LINE__, __func__);
+    WN_DEBUG(stderr , "\n%d calling %s", __LINE__, __func__);
 
     ctx->error_nl = err->error;
     ctx->is_done = 1;
@@ -502,7 +662,7 @@ static int wn_nl80211_scan_perform(wn_nl80211_ctx *obj, const char *iface,
     if (!genlmsg_put(req_msg, 0, 0, (*obj).nl80211_family_id, 0, 0,
         NL80211_CMD_TRIGGER_SCAN, 0))
     {
-        fprintf(stderr, "\n%d, genlmsg_put: %d (%s)",__LINE__, err, "failed");
+        WN_DEBUG(stderr, "\n%d, genlmsg_put: %d (%s)",__LINE__, err, "failed");
         goto ERR_EXIT_CB_PTR;
     }
     // setting msg
@@ -516,7 +676,8 @@ static int wn_nl80211_scan_perform(wn_nl80211_ctx *obj, const char *iface,
     /* @NL80211_ATTR_SCAN_SSIDS: *nested* attribute with SSIDs, leave out for passive
      *	scanning and include a zero-length SSID (wildcard(.?)) for wildcard scan */
     ((void)param);
-    /* // TODO: params
+     // TODO: params
+    /*
     if (!hc_list_empty(&param->ssid_list))
     {
         struct nl_msg *ssid_attr_msg;
@@ -616,7 +777,7 @@ static int wn_nl80211_scan_perform(wn_nl80211_ctx *obj, const char *iface,
         goto ERR_EXIT_CB_PTR;
     }
 
-    fprintf(stderr , "\n%d, before nl_send_sync", __LINE__);
+    WN_DEBUG(stderr , "\n%d, before nl_send_sync", __LINE__);
 
     // note that auto-ack is enabled by default;
     // requesting ack can be set with nl_socket_(enable/disable)_auto_ack
@@ -627,18 +788,18 @@ static int wn_nl80211_scan_perform(wn_nl80211_ctx *obj, const char *iface,
     {
         /* autocomplete (see room etc), send and wait for ack
          *(NL_OK should be returned by default handler)*/
-        fprintf(stderr, "\n%d, nl_send_sync: %d (%s)",__LINE__, err,
+        WN_DEBUG(stderr, "\n%d, nl_send_sync: %d (%s)",__LINE__, err,
             nl_geterror(-err));
         goto ERR_EXIT_SCAN_MEMBERSHIP;
     }
 
     // receiving msg
-    fprintf(stderr , "\n%d, before nl_recvmsgs", __LINE__);
+    WN_DEBUG(stderr , "\n%d, before nl_recvmsgs", __LINE__);
 
     do { // msges are not MULTIparted, so receiving in loop
-	    if ((err = nl_recvmsgs(obj->sock, callback_ptr)))
-	    {
-            fprintf(stderr, "\n%d, nl_recvmsgs: %d (%s)",__LINE__, err,
+        if ((err = nl_recvmsgs(obj->sock, callback_ptr)))
+        {
+            WN_DEBUG(stderr, "\n%d, nl_recvmsgs: %d (%s)",__LINE__, err,
                 nl_geterror(-err));
             goto ERR_EXIT_SCAN_MEMBERSHIP;
         }
@@ -710,20 +871,20 @@ int wn_nl80211_scan_get_ssid_info(wn_nl80211_ctx *ctx, const char *iface,
     if (!genlmsg_put(req_msg, 0, 0, (*ctx).nl80211_family_id, 0, NLM_F_DUMP/*(.?)*/,
         NL80211_CMD_GET_SCAN, 0))
     {
-        fprintf(stderr, "\n%d, genlmsg_put: %d (%s)",__LINE__, err, "failed");
+        WN_DEBUG(stderr, "\n%d, genlmsg_put: %d (%s)",__LINE__, err, "failed");
         goto ERR_EXIT_CB_PTR;
     }
 
     if ((err = nla_put_u32(req_msg, NL80211_ATTR_IFINDEX, iface_id)))
     {
-        fprintf(stderr, "\n%d, nla_put_u32: %d (%s)", __LINE__, err,
+        WN_DEBUG(stderr, "\n%d, nla_put_u32: %d (%s)", __LINE__, err,
             nl_geterror(-err));
         goto ERR_EXIT_CB_PTR;
     }
 
     if ((err = nl_cb_set(cb_ptr, NL_CB_VALID, NL_CB_CUSTOM, func, arg)))
     {
-        fprintf(stderr, "\n%d, nl_cb_set: %d (%s)",__LINE__, err,
+        WN_DEBUG(stderr, "\n%d, nl_cb_set: %d (%s)",__LINE__, err,
             nl_geterror(-err));
         goto ERR_EXIT_CB_PTR;
     }
@@ -736,25 +897,25 @@ int wn_nl80211_scan_get_ssid_info(wn_nl80211_ctx *ctx, const char *iface,
 
     if ((err = nl_socket_add_membership(ctx->sock, ctx->grp_id.scan)))
     {
-        fprintf(stderr, "\n%d, nl_socket_add_membership: %d (%s)",__LINE__, err,
-            nl_geterror(-err));
+        WN_DEBUG(stderr, "\n%d, nl_socket_add_membership: %d (%s)",__LINE__, 
+        	err, nl_geterror(-err));
         goto ERR_EXIT_CB_PTR;
     }
 
     // send request, do not need wait ack for this request (cmd) (why.?)
     err = nl_send_auto(ctx->sock, req_msg); // .
-                    // see http://www.infradead.org/~tgr/libnl/doc/api/nl_8c_source.html#l00469,
-                    // nl_send_sync does free the message after send it 
-                    // (but nl_send_auto does not).
+    // see http://www.infradead.org/~tgr/libnl/doc/api/nl_8c_source.html#l00469,
+    // nl_send_sync does free the message after send it 
+    // (but nl_send_auto does not).
     if (err < 0)
     {
-        fprintf(stderr, "\n%d, nl_cb_set: %d (%s)", __LINE__, err,
+        WN_DEBUG(stderr, "\n%d, nl_cb_set: %d (%s)", __LINE__, err,
             nl_geterror(-err));
         goto ERR_EXIT_SCAN_MEMBERSHIP;
     }
 
     // receive response (multipart)
-    fprintf(stderr , "\n%d calling %s", __LINE__, __func__);
+    WN_DEBUG(stderr , "\n%d calling %s", __LINE__, __func__);
     if ((err = nl_recvmsgs(ctx->sock, cb_ptr)))
         goto ERR_EXIT_SCAN_MEMBERSHIP;
 
@@ -782,36 +943,74 @@ inline static int
 {
     wn_nl80211_sta_info_node node;
     ((void)data);
+    
     if (wn_nl80211_sta_info_node_from_nl_msg_init(&node, msg))
     {
-        fprintf(stdout , "\nBAD at %d\n", __LINE__);
+        WN_DEBUG(stderr , "\nBAD at %d\n", __LINE__);
         return NL_SKIP;
     }
-
-    fprintf(stdout, "\n%.2hhx:%.2hhx:%.2hhx:%.2hhx:%.2hhx:%.2hhx"
-        " %.1f %u %.*s", node.bssid[0], node.bssid[1], node.bssid[2],
+    
+    printf("\nSSID: %.*s\n" 
+    	"BSSID: %.2hhx:%.2hhx:%.2hhx:%.2hhx:%.2hhx:%.2hhx"
+        "\nRSSI (dBm): %.1f\nFrequency (MHz): %u",
+        (int)node.ie.ssid.len, node.ie.ssid.data,
+        node.bssid[0], node.bssid[1], node.bssid[2],
         node.bssid[3], node.bssid[4], node.bssid[5], node.rssi_100dBm / 100. ,
-        node.frequency_MHz, (int)node.ie.ssid.len, node.ie.ssid.data);
+        node.frequency_MHz);
 
     if (node.ie.rates_Mbps.data)
     {
         size_t idx;
 
-        fprintf(stdout, " ");
+        printf("\nSupported Rates (Mbps):");
 
-        for (idx = 0; idx != node.ie.rates_Mbps.elem_num - 1; ++idx)
+        for (idx = 0; idx != node.ie.rates_Mbps.elem_num; ++idx)
         {
-            fprintf(stdout,
-                (node.ie.rates_Mbps.data[idx].decimal?"%hhu.%hhu,":"%hhu,"),
+            printf((node.ie.rates_Mbps.data[idx].decimal?" %hhu.%hhu":" %hhu"),
                 node.ie.rates_Mbps.data[idx].integer,
                 node.ie.rates_Mbps.data[idx].decimal);
         }
-
-        fprintf(stdout, (node.ie.rates_Mbps.data[idx].decimal?"%hhu.%hhu":"%hhu"),
-                node.ie.rates_Mbps.data[idx].integer,
-                node.ie.rates_Mbps.data[idx].decimal);
     }
-
+    
+    if (node.ie.group_cipher_suite.inited)
+    {
+        printf("\nBroadcast chipper: %.2hhX-%.2hhX-%.2hhX-%.2hhX",
+            node.ie.group_cipher_suite.data[0], 
+            node.ie.group_cipher_suite.data[1], 
+            node.ie.group_cipher_suite.data[2], 
+            node.ie.group_cipher_suite.data[3]);
+    }
+    
+    if (!hc_list_empty(&node.ie.pairwise_cipher_suits)) 
+    {
+        printf("\nPairwise chippers:");
+        for (hc_list_node *curr = hc_list_begin(&node.ie.pairwise_cipher_suits); 
+            curr != hc_list_end(&node.ie.pairwise_cipher_suits);
+            curr = hc_list_node_next(curr))
+        {
+            hc_list_int_node *node 
+                = hc_list_int_node_from_hc_list_node_shift(curr);
+            printf(" %.2hhX-%.2hhX-%.2hhX-%.2hhX",node->suffix[0], 
+                    node->suffix[1], node->suffix[2], node->suffix[3]);
+        }
+    }
+    
+    if (!hc_list_empty(&node.ie.auth_cipher_suits)) 
+    {
+        printf("\nAuth chippers:");
+        for (hc_list_node *curr = hc_list_begin(&node.ie.auth_cipher_suits); 
+            curr != hc_list_end(&node.ie.auth_cipher_suits);
+            curr = hc_list_node_next(curr))
+        {
+            hc_list_int_node *node 
+                = hc_list_int_node_from_hc_list_node_shift(curr);
+            printf(" %.2hhX-%.2hhX-%.2hhX-%.2hhX",node->suffix[0], 
+                    node->suffix[1], node->suffix[2], node->suffix[3]);
+        }
+    }
+    
+    printf("\n");
+    
     wn_nl80211_sta_info_node_free(&node);
 
     return NL_OK; // call transfers the ownership of
@@ -825,9 +1024,10 @@ int main (int arg_n, const char *(args[]))
     wn_nl80211_ctx wn_ctx;
     wn_nl80211_scan_param_t param;
 
-    if (arg_n < 2)
+    if (arg_n < 2) {
+        fprintf(stderr, "\nUsage: wnshow <iface name>\n");
         return -1;
-
+    }
     const char *iface = args[1];
 
     if (wn_nl80211_ctx_init(&wn_ctx))
@@ -836,7 +1036,7 @@ int main (int arg_n, const char *(args[]))
     if (wn_nl80211_scan_param_init(&param))
         goto ERR_EXIT_WN_NL80211_CTX;
     // TODO :
-    // wn_nl80211_scan_param_add_ssid_str(&param, "GL-Misc1");
+   // wn_nl80211_scan_param_add_ssid(&param, (const unsigned char *)"", 0);
     // (const unsigned char *)"", 0); // broadcasting probe
    // wn_nl80211_scan_param_add_frequency(&param, 2500);
     if (wn_nl80211_scan_perform(&wn_ctx, iface, &param))
@@ -855,6 +1055,6 @@ ERR_EXIT_WN_NL80211_SCAN_PARAM:
 ERR_EXIT_WN_NL80211_CTX:
     wn_nl80211_ctx_free(&wn_ctx);
 ERR_EXIT:
-    fprintf(stderr , "\n\nERROR\n");
+    WN_DEBUG(stderr , "\n\nERROR\n");
     return -1;
 }

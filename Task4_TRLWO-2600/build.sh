@@ -1,1 +1,0 @@
-gcc -g3 wn_beacon_list.c $(pkg-config --cflags libnl-genl-3.0) $(pkg-config --libs libnl-genl-3.0) -pedantic -Wall -Wextra -DNDEBUG
